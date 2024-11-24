@@ -5,8 +5,8 @@ local HEIGHT_SCALE = 5      -- Maximum height variation
 local PERLIN_SCALE = 0.2     -- Controls terrain smoothness
 local GROUND_LEVEL = 0       -- Base level for the flat ground
 local LOAD_RADIUS = 3        -- How many chunks to load around the player
-local STRUCTURE_SPAWN_CHANCE = 0 -- 0% chance for a structure in a chunk
-local CurrentBiome = "Plain"
+local STRUCTURE_SPAWN_CHANCE = 0 -- 5% chance for a structure in a chunk
+
 
 -- Seed for world generation
 local WORLD_SEED = math.random(0, 999999)
@@ -24,56 +24,82 @@ local StructureLibrary = {
 -- Biomes
 local Biomes = {
 	["Plain"] = {
-		HEIGHT_SCALE = 5
+		HEIGHT_SCALE = 5,
+		Material = Enum.Material.Grass,
+		Color = BrickColor.Green()
 	},
 	["Mountains"] = {
-		HEIGHT_SCALE = 10
+		HEIGHT_SCALE = 40,
+		Material = Enum.Material.Rock,
+		Color = BrickColor.Gray()
 	},
 }
 
 -- Store loaded chunks
 local loadedChunks = {}
 
+-- Track active loops for players
+local activeLoops = {}
+
 local BlockModificationModule = require(game.ServerStorage.BlockModificationModule)
 local blockModifications = BlockModificationModule.blockModifications -- Shared data table
 
+-- Function to determine the biome based on coordinates
+function getBiome(chunkX, chunkZ)
+	local noiseValue = math.noise(chunkX * 0.1, chunkZ * 0.1) -- Adjust scale for biome size
+	if noiseValue > 0.5 then
+		return "Mountains"
+	else
+		return "Plain"
+	end
+end
+
 -- Function to calculate height using Perlin noise
-local function getHeight(x, z)
+function getHeight(x, z, heightScale)
 	local noiseValue = math.noise((x + WORLD_SEED) * PERLIN_SCALE, (z + WORLD_SEED) * PERLIN_SCALE)
-	return math.floor(noiseValue * HEIGHT_SCALE + 0.5) -- Rounded for consistent heights
+	return math.floor(noiseValue * heightScale + 0.5) -- Rounded for consistent heights
 end
 
 -- Function to create a block
-local function createBlock(x, y, z, parent)
+function createBlock(x, y, z, material, color, parent)
 	local block = Instance.new("Part")
 	block.Size = Vector3.new(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE)
 	block.Position = Vector3.new(x, y, z)
 	block.Anchored = true
 	block.TopSurface = Enum.SurfaceType.Smooth
 	block.BottomSurface = Enum.SurfaceType.Smooth
-	block.BrickColor = BrickColor.Green()
-	block.Material = Enum.Material.Grass
+	block.BrickColor = color
+	block.Material = material
 	block.Parent = parent
 end
 
 -- Function to place a structure
-local function placeStructure(structureName, x, z, parent)
+function placeStructure(structureName, x, z, parent)
 	local structureModel = StructureLibrary[structureName]:Clone()
-	local height = getHeight(x / BLOCK_SIZE, z / BLOCK_SIZE) * BLOCK_SIZE
+	local height = getHeight(x / BLOCK_SIZE, z / BLOCK_SIZE, HEIGHT_SCALE) * BLOCK_SIZE
 
 	structureModel:SetPrimaryPartCFrame(CFrame.new(x, height, z))
 	structureModel.Parent = parent
 end
 
 -- Function to generate a chunk
-local function generateChunk(chunkX, chunkZ)
+function generateChunk(chunkX, chunkZ)
 	local chunkKey = chunkX .. "," .. chunkZ
 	if loadedChunks[chunkKey] then return end -- Skip if already generated
+
+	-- Determine the biome for this chunk
+	local biome = getBiome(chunkX, chunkZ)
+	local biomeSettings = Biomes[biome]
 
 	-- Create a folder for the chunk
 	local chunkFolder = Instance.new("Folder")
 	chunkFolder.Name = "Chunk_" .. chunkKey
 	chunkFolder.Parent = WorldFolder
+
+	-- Adjust biome-specific parameters
+	local heightScale = biomeSettings.HEIGHT_SCALE
+	local material = biomeSettings.Material
+	local color = biomeSettings.Color
 
 	-- Generate the flat ground layer for this chunk
 	for x = 0, CHUNK_SIZE - 1 do
@@ -88,10 +114,10 @@ local function generateChunk(chunkX, chunkZ)
 			end
 
 			-- Create the ground block
-			createBlock(worldX, GROUND_LEVEL, worldZ, chunkFolder)
+			createBlock(worldX, GROUND_LEVEL, worldZ, material, color, chunkFolder)
 
-			-- Calculate surface height
-			local surfaceHeight = getHeight(worldX / BLOCK_SIZE, worldZ / BLOCK_SIZE) * BLOCK_SIZE
+			-- Calculate surface height based on biome
+			local surfaceHeight = getHeight(worldX / BLOCK_SIZE, worldZ / BLOCK_SIZE, heightScale) * BLOCK_SIZE
 
 			-- Fill blocks up to the surface
 			for y = GROUND_LEVEL + BLOCK_SIZE, surfaceHeight, BLOCK_SIZE do
@@ -99,7 +125,7 @@ local function generateChunk(chunkX, chunkZ)
 				if blockModifications[chunkKey] and blockModifications[chunkKey][blockYKey] then
 					continue -- Skip creation if the block was destroyed
 				end
-				createBlock(worldX, y, worldZ, chunkFolder)
+				createBlock(worldX, y, worldZ, material, color, chunkFolder)
 			end
 		end
 	end
@@ -117,7 +143,7 @@ local function generateChunk(chunkX, chunkZ)
 end
 
 -- Function to unload chunks outside the radius
-local function unloadChunks(playerChunkX, playerChunkZ)
+function unloadChunks(playerChunkX, playerChunkZ)
 	for chunkKey, chunkFolder in pairs(loadedChunks) do
 		local chunkX, chunkZ = chunkKey:match("([^,]+),([^,]+)")
 		chunkX = tonumber(chunkX)
@@ -132,7 +158,7 @@ local function unloadChunks(playerChunkX, playerChunkZ)
 end
 
 -- Function to update chunks around the player
-local function updateChunks(playerPosition)
+function updateChunks(playerPosition)
 	local playerChunkX = math.floor(playerPosition.X / (CHUNK_SIZE * BLOCK_SIZE))
 	local playerChunkZ = math.floor(playerPosition.Z / (CHUNK_SIZE * BLOCK_SIZE))
 
@@ -152,10 +178,24 @@ game.Players.PlayerAdded:Connect(function(player)
 	player.CharacterAdded:Connect(function(character)
 		local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
 
-		while true do
+		-- Stop previous loop if it exists
+		if activeLoops[player] then
+			activeLoops[player]:Disconnect()
+		end
+
+		-- Start a new loop for this player
+		local connection
+		connection = game:GetService("RunService").Heartbeat:Connect(function()
+			if not character or not humanoidRootPart then
+				connection:Disconnect()
+				activeLoops[player] = nil
+				return
+			end
+
 			-- Update chunks based on the player's position
 			updateChunks(humanoidRootPart.Position)
-			wait(0.5) -- Adjust as needed for performance
-		end
+		end)
+
+		activeLoops[player] = connection
 	end)
 end)
